@@ -606,6 +606,55 @@ var validateDockerfilesPinning fileparser.DoWhileTrueOnFileContent = func(
 	return true, nil
 }
 
+// getGitHubWorkflowRunScriptOffset returns the base line offset used when
+// mapping parsed shell commands back to the workflow source. Block and folded
+// scalars execute from lines after the run key, while inline scalars execute on
+// the run key's line. The shell parser adds its own 1-based command offset.
+func getGitHubWorkflowRunScriptOffset(content []byte, execRun *actionlint.ExecRun) uint {
+	if execRun == nil || execRun.Run == nil {
+		return checker.OffsetDefault
+	}
+
+	var startLine uint
+	switch {
+	case execRun.RunPos != nil && execRun.RunPos.Line > 0:
+		startLine = uint(execRun.RunPos.Line)
+	case execRun.Run.Pos != nil && execRun.Run.Pos.Line > 0:
+		startLine = uint(execRun.Run.Pos.Line)
+	default:
+		return checker.OffsetDefault
+	}
+
+	if execRun.RunPos == nil || execRun.RunPos.Line < 1 || execRun.RunPos.Col < 1 {
+		return startLine
+	}
+	lines := bytes.Split(content, []byte{'\n'})
+	lineIndex := execRun.RunPos.Line - 1
+	if lineIndex >= len(lines) {
+		return startLine
+	}
+	line := lines[lineIndex]
+	columnIndex := execRun.RunPos.Col - 1
+	if columnIndex >= len(line) {
+		return startLine
+	}
+
+	runSource := string(line[columnIndex:])
+	colon := strings.IndexByte(runSource, ':')
+	if colon < 0 {
+		return startLine
+	}
+	value := strings.TrimSpace(runSource[colon+1:])
+	if value == "" || strings.HasPrefix(value, "|") || strings.HasPrefix(value, ">") || strings.HasPrefix(value, "#") {
+		return startLine
+	}
+
+	if startLine > 0 {
+		return startLine - 1
+	}
+	return startLine
+}
+
 func collectGitHubWorkflowScriptInsecureDownloads(c *checker.CheckRequest, r *checker.PinningDependenciesData) error {
 	return fileparser.OnMatchingFileContentDo(c.RepoClient, fileparser.PathMatcher{
 		Pattern:       ".github/workflows/*",
@@ -696,7 +745,8 @@ var validateGitHubWorkflowIsFreeOfInsecureDownloads fileparser.DoWhileTrueOnFile
 
 			// We replace the `${{ github.variable }}` to avoid shell parsing failures.
 			script := githubVarRegex.ReplaceAll([]byte(run), []byte("GITHUB_REDACTED_VAR"))
-			if err := validateShellFile(pathfn, uint(execRun.Run.Pos.Line), uint(execRun.Run.Pos.Line),
+			startLine := getGitHubWorkflowRunScriptOffset(content, execRun)
+			if err := validateShellFile(pathfn, startLine, startLine,
 				script, taintedFiles, pdata); err != nil {
 				pdata.Dependencies = append(pdata.Dependencies, checker.Dependency{
 					Msg: asPointer(err.Error()),
